@@ -27,11 +27,33 @@ function getQuery(reqUrl) {
   }
 }
 
-function postMessagePage(msg) {
+// Two-step handshake: popup sends "authorizing:github" first,
+// waits for CMS to reply, then sends the token.
+// This is the pattern Decap CMS / Sveltia CMS expects.
+function callbackPage(provider, token) {
+  const successMsg = 'authorization:' + provider + ':success:' +
+    JSON.stringify({ token: token, provider: provider });
   return '<!doctype html><html><body><script>' +
-    'var msg=' + JSON.stringify(msg) + ';' +
-    'if(window.opener){window.opener.postMessage(msg,"*");window.close();}' +
-    'else{document.body.innerText="Auth complete. You may close this window.";window.close();}' +
+    'var provider=' + JSON.stringify(provider) + ';' +
+    'var successMsg=' + JSON.stringify(successMsg) + ';' +
+    'window.addEventListener("message",function(e){' +
+    '  if(e.data==="authorizing:"+provider){' +
+    '    window.opener.postMessage(successMsg,e.origin);' +
+    '    window.close();' +
+    '  }' +
+    '});' +
+    'window.opener.postMessage("authorizing:"+provider,"*");' +
+    '</script></body></html>';
+}
+
+function errorPage(provider, error) {
+  const errMsg = 'authorization:' + provider + ':error:' +
+    JSON.stringify({ error: error });
+  return '<!doctype html><html><body><script>' +
+    'var provider=' + JSON.stringify(provider) + ';' +
+    'var errMsg=' + JSON.stringify(errMsg) + ';' +
+    'window.opener.postMessage(errMsg,"*");' +
+    'window.close();' +
     '</script></body></html>';
 }
 
@@ -45,26 +67,30 @@ http.createServer((req, res) => {
     return send(res, 200, 'GGdove OAuth Proxy — OK', 'text/plain');
   }
 
+  // GET /auth → redirect to GitHub OAuth
   if (pathname === '/auth') {
-    const scope = query.scope || 'repo,user';
-    const state = query.state || '';
+    const provider = query.provider || 'github';
+    const scope    = query.scope || 'repo,user';
+    const state    = query.state || '';
     const ghUrl =
       'https://github.com/login/oauth/authorize' +
       '?client_id='  + encodeURIComponent(CLIENT_ID) +
       '&scope='      + encodeURIComponent(scope) +
       '&state='      + encodeURIComponent(state);
-    console.log('[auth] redirecting to GitHub');
+    console.log('[auth] provider=' + provider + ' redirecting to GitHub');
     res.writeHead(302, { Location: ghUrl });
     return res.end();
   }
 
+  // GET /callback → exchange code for token, do two-step handshake
   if (pathname === '/callback') {
-    const code  = query.code  || '';
-    const state = query.state || '';
+    const provider = 'github';
+    const code     = query.code  || '';
+    const state    = query.state || '';
     console.log('[callback] code:', code ? code.substring(0,8)+'...' : 'MISSING');
 
     if (!code) {
-      return send(res, 200, postMessagePage('authorization:github:error:' + JSON.stringify({error:'missing_code'})));
+      return send(res, 200, errorPage(provider, 'missing_code'));
     }
 
     const postBody = qs.stringify({
@@ -88,28 +114,32 @@ http.createServer((req, res) => {
       ghRes.on('data', c => raw += c);
       ghRes.on('end', () => {
         if (done) return; done = true;
-        console.log('[callback] GitHub raw:', raw.substring(0,120));
-        let msg;
+        console.log('[callback] GitHub raw:', raw.substring(0, 120));
         try {
           const d = JSON.parse(raw);
-          msg = (d.error || !d.access_token)
-            ? 'authorization:github:error:' + JSON.stringify({error: d.error||'no_token'})
-            : 'authorization:github:success:' + JSON.stringify({token: d.access_token, provider:'github'});
+          if (d.error || !d.access_token) {
+            console.log('[callback] error from GitHub:', d.error);
+            send(res, 200, errorPage(provider, d.error || 'no_token'));
+          } else {
+            console.log('[callback] success, sending handshake page');
+            send(res, 200, callbackPage(provider, d.access_token));
+          }
         } catch(e) {
-          msg = 'authorization:github:error:' + JSON.stringify({error:'parse_error'});
+          console.error('[callback] parse error:', e.message);
+          send(res, 200, errorPage(provider, 'parse_error'));
         }
-        send(res, 200, postMessagePage(msg));
       });
     });
+
     ghReq.on('error', e => {
       if (done) return; done = true;
       console.error('[callback] network error:', e.message);
-      send(res, 200, postMessagePage('authorization:github:error:' + JSON.stringify({error:'network_error'})));
+      send(res, 200, errorPage(provider, 'network_error'));
     });
     ghReq.setTimeout(10000, () => {
       if (done) return; done = true;
       ghReq.destroy();
-      send(res, 200, postMessagePage('authorization:github:error:' + JSON.stringify({error:'timeout'})));
+      send(res, 200, errorPage(provider, 'timeout'));
     });
     ghReq.write(postBody);
     ghReq.end();
