@@ -1,0 +1,8 @@
+{
+  "name": "ggdove-cms-auth",
+  "version": "1.0.0",
+  "description": "Decap CMS GitHub OAuth proxy for GGdove portfolio",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=18" }
+}
